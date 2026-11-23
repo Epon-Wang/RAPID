@@ -1,93 +1,86 @@
-# RAPID
+# RAPID Real2Sim for BRACE
 
-**Robot Agentic Programming from Demonstrations**
+This branch (`brace`) is a trimmed fork of
+[RAPID](https://github.com/nature21/RAPID) that keeps only its **Real2Sim**
+pipeline and writes its results straight into the
+[BRACE](../../README.md) project. Everything else RAPID does (primitive
+construction, strategy composition, the benchmark, the Codex invention agents,
+Judo) has been removed here; it is all still on the `main` branch.
 
-[Paper](https://arxiv.org/abs/2609.30249) · [Environment setup](SETUP.md) ·
-[Experiment workflow](SUITE_RUNS.md) · [Visualization tools](vistools/README.md) ·
-[Reproduce experiments](SETUP.md#reproduce-the-experiments) ·
-[MIT license](LICENSE)
+Real2Sim takes an RGB image, the first frame of a video, or a calibrated RGB-D
+capture, and produces a MuJoCo scene: a VLM lists the objects, SAM3 segments
+them, SAM 3D Objects reconstructs their meshes, FoundationPose refines their
+poses, and the result is validated, given box collisions, and settled.
 
-RAPID constructs reusable manipulation programs from demonstrations and
-language instructions. This repository contains the FR3 nonprehensile
-manipulation pipeline and staged construction and evaluation
-infrastructure. The clean source tree contains shared infrastructure; concrete
-primitives and strategies are generated in isolated experiment workspaces.
+## Layout
 
-RAPID includes demonstrations, reconstructed scenes, and the tools to
-reproduce agent invention and simulation evaluation, locally or with Slurm.
-The supplied scenes let these experiments run without reconstruction services.
-To reconstruct new scenes, use the [Real2Sim pipeline and model servers](SETUP.md#reconstruct-new-scenes).
-The matching [Judo-osc](https://github.com/nature21/Judo-osc) runtime is pinned as a submodule.
+| Path | Purpose |
+| --- | --- |
+| `real2sim/` | The pipeline, packaging, and the scene-repair agent skill. |
+| `server/` | HTTP adapters for the model services (SAM3, SAM 3D Objects, FoundationPose, Depth Anything 3). |
+| `vistools/` | RGB-D input helpers and scene preview. |
+| `scripts/` | Entry points; see [scripts/README.md](scripts/README.md). |
+| `demos/primitive/push/` | One calibrated RGB-D capture, usable as a reconstruction input. |
+| `examples/push_scene/` | Its finished reconstruction, for trying the packaging step without any model service. |
+| `calibration/` | Default hand-eye calibration used when capturing. |
+| `tests/` | Tests; they run against local stand-ins for the model services. |
 
-## Program representation
+## Usage
 
-| Term | Implementation | Meaning |
-| --- | --- | --- |
-| Primitive | `workspace/src/primitives/<name>/` | Reusable manipulation program with a relational interface, geometry resolver, objective and success predicate. |
-| Strategy | `workspace/src/strategies/<name>/` | Ordered primitive calls with semantic role maps and connecting constraints resolved from the live phase-start state. |
-| Instantiation | `workspace/src/instantiations/` | Concrete scene-role bindings; primitive invocations also supply effect arguments. |
+The environment is the `brace` conda environment from BRACE's README.
 
-Shared compilation and control code lives in `primitive_core`. Shared binding
-contracts and execution utilities live in `instantiation_core`.
-
-## Start here
-
-Follow [SETUP.md](SETUP.md) to create the **`rapid` conda environment** from
-[environment.yml](environment.yml) and build the required native extensions.
-From the repository root:
+To try packaging without any model service, use the bundled reconstruction:
 
 ```bash
-./scripts/rapid-python --rapid-env
-./scripts/rapid-suite --help
+./scripts/rapid-real2sim examples/push_scene --preview
+```
+
+A real reconstruction also needs a VLM endpoint and the model services; see
+[SETUP.md](SETUP.md).
+
+```bash
+# Reconstruct from a calibrated RGB-D capture and package the scene.
+./scripts/rapid-real2sim demos/primitive/push --name my_scene \
+  --vlm-model "$RAPID_VLM_MODEL" --preview
+
+# Re-package an existing reconstruction output.
+./scripts/rapid-real2sim results/real2sim/my_scene --force
+
+# Look at a packaged scene.
+./scripts/rapid-real2sim view my_scene --viewer
+```
+
+Intermediate reconstruction artifacts go to `results/real2sim/<name>/`. The
+packaged scene goes to `assets/scenes/<name>/` inside the installed `brace`
+package; pass `--tasks-root` to write somewhere else.
+
+## Packaged scene layout
+
+```
+<name>/
+├── scene.json        # index: floor, default camera, and every object's resting pose
+├── objects/<body>.xml  # one standalone MJCF per object, body at the origin
+├── meshes/           # visual meshes shared by scene.xml and objects/
+├── scene.xml         # the whole scene in one MJCF: floor, lights, all objects
+├── metadata.json     # object labels
+└── settling.json     # report of the settling simulation
+```
+
+`scene.json` lists, for each object: `name` (label), `body` (MuJoCo body name),
+`file`, `fixed`, `pos`, `quat` (w, x, y, z), `mass`, and `friction`. Poses are in
+the scene frame, which for a calibrated RGB-D capture is the robot base frame.
+`floor.height` is the height of the support plane in that frame.
+
+BRACE loads these directories with `brace.utils.scenes.load_scene`.
+
+## Tests
+
+```bash
 ./scripts/rapid-python -m pytest -q
 ```
 
-The workflow has four stages:
+## License and citation
 
-1. Install the supplied demonstrations, reconstructed scenes, and benchmark
-   assets following [SETUP.md](SETUP.md#simulation-assets).
-2. Construct primitives with `scripts/rapid-construct-primitive` or the batch
-   launcher `run_primitive_construction.sh`.
-3. Compose strategies with `agent/compose_strategy_exec.py` or the batch
-   launcher `run_strategy_composition.sh`.
-4. Bind and execute frozen programs on new scenes using the instantiation and
-   deployment helpers; use `run_eval.sh` / `launch_evals.sh` for benchmark evaluation.
-
-Use `scripts/rapid-experiment-local` for a complete trial without Slurm, or
-`launch_experiments.sh` for cluster job arrays. Asset installation and both
-workflows are documented in [SETUP.md](SETUP.md#reproduce-the-experiments).
-The batch launchers contain configurable development-cluster resource settings.
-During strategy construction,
-evidence-backed reusable primitive repairs remain supported and require fresh
-qualification; held-out deployment keeps the learned programs frozen.
-
-## Tasks
-
-| Task / demo | Sequence |
-| --- | --- |
-| 1 | push → push |
-| 2 | push → flip → grasp |
-| 3 | press_move → push → flip → grasp |
-| 4 | push → flip → press_move → grasp |
-| 5 | push → flip → press_move |
-| 6 | pivot → push → press_move |
-| 7 | topple → grasp |
-| 8 | press_move → grasp |
-
-## Assets and results
-
-Recorded demonstrations and scene meshes/textures are inputs. Some required
-assets and generated benchmark scenes are excluded from Git. Restore the
-separate [simulation asset ZIP](https://github.com/nature21/RAPID/releases/download/v0.1.0-preview.1/rapid-assets-20261017.zip)
-and [SHA-256 checksum](https://github.com/nature21/RAPID/releases/download/v0.1.0-preview.1/rapid-assets-20261017.zip.sha256),
-following the [installation instructions](SETUP.md#simulation-assets).
-
-Strategy demonstrations live in `demos/strategy/demo_N/`; primitive
-demonstrations live in `demos/primitive/<name>/`. Both include tracked
-first-frame metric depth in `depth.npy`.
-Pre-segmented demonstration clips are included; the
-[segmentation agent and clip-generation code](demos/strategy/.agents/skills/segment-demo-videos/)
-are also provided.
-
-Generated workspaces, experiment logs, and result galleries live under
-`suite_runs/` and are excluded from Git.
+RAPID is released under the [MIT license](LICENSE); cite it with
+[CITATION.cff](CITATION.cff). The original README, the full setup guide, and
+the rest of the code are on the `main` branch and upstream.

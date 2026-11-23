@@ -1,10 +1,12 @@
-"""Package real2sim outputs as sanitized task scene modules."""
+"""Package real2sim outputs as scene directories for the brace package."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import posixpath
 import re
 import shutil
 import sys
@@ -12,6 +14,7 @@ import textwrap
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import mujoco
 import numpy as np
 import trimesh
 
@@ -43,23 +46,25 @@ MTL_TEXTURE_KEYS = {
     "norm",
 }
 
-FR3_HOME_JOINT_QPOS: dict[str, float] = {
-    "fr3_joint1": -0.0030637685314503847,
-    "fr3_joint2": -0.7778934457717781,
-    "fr3_joint3": 0.01585533499243391,
-    "fr3_joint4": -2.3693353790401894,
-    "fr3_joint5": -0.004060005459262234,
-    "fr3_joint6": 1.554097367289531,
-    "fr3_joint7": 0.7704814906387026,
-    "finger_joint1": 0.04,
-    "finger_joint2": 0.04,
-}
-DEFAULT_FR3_BASE_POS = (0.0, 0.0, 0.0)
-DEFAULT_FR3_BASE_QUAT = (1.0, 0.0, 0.0, 0.0)
+SCENE_FORMAT = "brace-real2sim-scene"
+SCENE_FORMAT_VERSION = 1
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def default_scenes_root() -> Path:
+    """Return ``assets/scenes`` inside the installed ``brace`` package."""
+
+    try:
+        import brace
+    except ImportError as exc:
+        raise RuntimeError(
+            "the brace package is not importable, so there is no default scene "
+            "root; activate the brace environment or pass --tasks-root"
+        ) from exc
+    return Path(brace.__file__).resolve().parent / "assets" / "scenes"
 
 
 def _snake_identifier(value: str) -> str:
@@ -520,144 +525,145 @@ def _scene_object_bodies(scene_root: ET.Element) -> list[str]:
     return bodies
 
 
-def _scene_py(
-    package_name: str,
-    default_camera: dict[str, object],
-) -> str:
-    return f'''"""Task scene for the packaged real2sim {package_name} bundle."""
+def _write_object_files(scene_dir: Path) -> list[dict[str, object]]:
+    """Split ``scene.xml`` into one standalone MJCF per reconstructed object.
 
-from __future__ import annotations
+    Each file holds a single body at the origin together with the defaults and
+    assets it uses. The body's resting pose in the scene is returned instead, so
+    a consumer can place the object itself.
+    """
 
-from pathlib import Path
-from typing import Any
+    scene_root = ET.parse(scene_dir / "scene.xml").getroot()
+    scene_model = mujoco.MjModel.from_xml_path(str(scene_dir / "scene.xml"))
+    labels = {
+        str(item["body"]): str(item["name"])
+        for item in json.loads(
+            (scene_dir / "metadata.json").read_text(encoding="utf-8")
+        )["objects"]
+    }
+    assets = scene_root.find("asset")
+    asset_elements = [] if assets is None else list(assets)
+    objects_dir = scene_dir / "objects"
+    objects_dir.mkdir()
 
-import mujoco
+    entries: list[dict[str, object]] = []
+    for body in scene_root.findall("./worldbody/body"):
+        name = str(body.get("name", ""))
+        if name not in labels:
+            continue
+        object_root = ET.Element("mujoco", {"model": name})
+        ET.SubElement(object_root, "compiler", _object_compiler(scene_root))
+        default = scene_root.find("default")
+        if default is not None:
+            object_root.append(copy.deepcopy(default))
+        object_body = copy.deepcopy(body)
+        for key in ("pos", "quat", "axisangle", "euler", "xyaxes", "zaxis"):
+            object_body.attrib.pop(key, None)
+        used = _referenced_assets(object_body, asset_elements)
+        if used:
+            object_asset = ET.SubElement(object_root, "asset")
+            object_asset.extend(copy.deepcopy(element) for element in used)
+        ET.SubElement(object_root, "worldbody").append(object_body)
+        relative = Path("objects") / f"{name}.xml"
+        _write_scene_xml(object_root, scene_dir / relative)
 
-from scene_io.runtime_assets import fr3_task_v1_xml
+        object_model = mujoco.MjModel.from_xml_path(str(scene_dir / relative))
+        body_id = scene_model.body(name).id
+        entries.append(
+            {
+                "name": labels[name],
+                "body": name,
+                "file": relative.as_posix(),
+                "fixed": body.find("freejoint") is None and body.find("joint") is None,
+                "pos": [float(value) for value in scene_model.body_pos[body_id]],
+                "quat": [float(value) for value in scene_model.body_quat[body_id]],
+                "mass": float(object_model.body_subtreemass[1]),
+                "friction": _collision_friction(object_model),
+            }
+        )
+    return entries
 
 
-_PACKAGE_NAME = {package_name!r}
-_PACKAGE_DIR = Path(__file__).resolve().parent
-SCENE_DIR = _PACKAGE_DIR / "bundle"
-SCENE_XML = SCENE_DIR / "scene.xml"
-FR3_XML = fr3_task_v1_xml()
-CONFIG: dict[str, Any] = {{
-    "scene_dir": SCENE_DIR,
-    "scene_xml": SCENE_XML,
-    "fr3_xml": FR3_XML,
-    "task_name": f"real2sim_{{_PACKAGE_NAME}}",
-}}
+def _object_compiler(scene_root: ET.Element) -> dict[str, str]:
+    """Scene compiler settings, with asset directories rebased for ``objects/``."""
 
-DEFAULT_CAMERA: dict[str, Any] = {_camera_literal(default_camera)}
-FR3_HOME_JOINT_QPOS: dict[str, float] = {FR3_HOME_JOINT_QPOS!r}
-FR3_BASE_POS = {DEFAULT_FR3_BASE_POS!r}
-FR3_BASE_QUAT = {DEFAULT_FR3_BASE_QUAT!r}
-FR3_MOUNT_FRAME = "fr3_mount"
+    compiler = scene_root.find("compiler")
+    attributes = {} if compiler is None else dict(compiler.attrib)
+    shared = attributes.pop("assetdir", None)
+    for key in ("meshdir", "texturedir"):
+        value = attributes.get(key, shared or ".")
+        if not posixpath.isabs(value):
+            value = posixpath.normpath(posixpath.join("..", value))
+        attributes[key] = value
+    return attributes
 
 
-def make_spec() -> mujoco.MjSpec:
-    """Compose the reconstruction and standalone FR3 submodel."""
+def _referenced_assets(body: ET.Element, assets: list[ET.Element]) -> list[ET.Element]:
+    """Assets used by ``body``, in their original order."""
 
-    scene = mujoco.MjSpec.from_file(str(SCENE_XML))
-    robot = mujoco.MjSpec.from_file(str(FR3_XML))
-    home = robot.add_key(name="home")
-    home.qpos = list(FR3_HOME_JOINT_QPOS.values())
-    home.ctrl = [
-        FR3_HOME_JOINT_QPOS[f"fr3_joint{{index}}"] for index in range(1, 8)
-    ] + [FR3_HOME_JOINT_QPOS["finger_joint1"]]
-    mount = scene.worldbody.add_frame(
-        name=FR3_MOUNT_FRAME,
-        pos=FR3_BASE_POS,
-        quat=FR3_BASE_QUAT,
+    wanted = {
+        (key, value)
+        for element in body.iter()
+        for key in ("mesh", "material", "hfield")
+        if (value := element.get(key))
+    }
+    for element in assets:
+        if element.tag == "material" and ("material", element.get("name")) in wanted:
+            for textured in (element, *element.findall("layer")):
+                if texture := textured.get("texture"):
+                    wanted.add(("texture", texture))
+    return [element for element in assets if (element.tag, element.get("name")) in wanted]
+
+
+def _collision_friction(model: mujoco.MjModel) -> list[float] | None:
+    for geom_id in range(model.ngeom):
+        if model.geom_contype[geom_id] or model.geom_conaffinity[geom_id]:
+            return [float(value) for value in model.geom_friction[geom_id]]
+    return None
+
+
+def _floor_record(scene_dir: Path) -> dict[str, object] | None:
+    """Height and friction of the support plane, if the scene has one."""
+
+    scene_root = ET.parse(scene_dir / "scene.xml").getroot()
+    planes = [
+        geom
+        for geom in scene_root.findall("./worldbody/geom")
+        if geom.get("type") == "plane" and geom.get("name")
+    ]
+    if not planes:
+        return None
+    floor = next((geom for geom in planes if geom.get("name") == "floor"), planes[0])
+    model = mujoco.MjModel.from_xml_path(str(scene_dir / "scene.xml"))
+    geom_id = model.geom(str(floor.get("name"))).id
+    return {
+        "height": float(model.geom_pos[geom_id][2]),
+        "friction": [float(value) for value in model.geom_friction[geom_id]],
+    }
+
+
+def _write_scene_json(
+    scene_dir: Path,
+    *,
+    name: str,
+    camera: dict[str, object],
+    objects: list[dict[str, object]],
+) -> None:
+    payload = {
+        "format": SCENE_FORMAT,
+        "version": SCENE_FORMAT_VERSION,
+        "name": name,
+        "floor": _floor_record(scene_dir),
+        "camera": {
+            key: np.asarray(value, dtype=float).tolist()
+            for key, value in camera.items()
+        },
+        "objects": objects,
+    }
+    (scene_dir / "scene.json").write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
     )
-    # Passing the empty prefix preserves the canonical FR3 names. Omitting the
-    # argument makes MjSpec add a leading slash to every attached name.
-    scene.attach(robot, prefix="", frame=mount)
-    return scene
-
-
-def make_model() -> mujoco.MjModel:
-    """Return the compiled reconstruction-plus-FR3 model."""
-
-    return make_spec().compile()
-
-
-def make_data(model: mujoco.MjModel | None = None) -> mujoco.MjData:
-    """Return data with the FR3 at home and its gripper open."""
-
-    model = make_model() if model is None else model
-    data = mujoco.MjData(model)
-    home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
-    if home_id < 0:
-        raise KeyError("missing FR3 home keyframe")
-    mujoco.mj_resetDataKeyframe(model, data, home_id)
-    mujoco.mj_forward(model, data)
-    return data
-
-
-def launch_viewer() -> None:
-    """Open this composed scene in MuJoCo's interactive viewer."""
-
-    import mujoco.viewer
-
-    model = make_model()
-    mujoco.viewer.launch(model, make_data(model))
-
-
-__all__ = [
-    "CONFIG",
-    "DEFAULT_CAMERA",
-    "FR3_BASE_POS",
-    "FR3_BASE_QUAT",
-    "FR3_HOME_JOINT_QPOS",
-    "FR3_XML",
-    "SCENE_DIR",
-    "launch_viewer",
-    "make_data",
-    "make_model",
-    "make_spec",
-]
-
-
-if __name__ == "__main__":
-    launch_viewer()
-'''
-
-
-def _camera_literal(camera: dict[str, object]) -> str:
-    values = dict(camera)
-    lookat = values.get("camera_lookat")
-    if lookat is not None:
-        values["camera_lookat"] = tuple(lookat)  # type: ignore[arg-type]
-    return repr(values)
-
-
-def _replay_py(package_name: str) -> str:
-    return f'''"""Replay / record entry points for the real2sim {package_name} task."""
-
-from __future__ import annotations
-
-from scene_io.playback import make_playback
-from tasks.invention_real2sim.{package_name}.scene import DEFAULT_CAMERA, make_spec
-
-
-playback = make_playback(
-    spec_builder=make_spec,
-    default_camera=DEFAULT_CAMERA,
-    default_output="real2sim_{package_name}_replay.mp4",
-)
-
-replay_browser = playback.browser
-replay_mujoco = playback.mujoco
-record_video = playback.record
-'''
-
-
-def _init_py(package_name: str) -> str:
-    return f'''"""Packaged real2sim task scene: {package_name}."""
-
-from __future__ import annotations
-'''
 
 
 def package_scene(
@@ -667,7 +673,13 @@ def package_scene(
     tasks_root: str | Path | None = None,
     force: bool = False,
 ) -> Path:
-    """Create or refresh a sanitized task scene from a real2sim output dir."""
+    """Create or refresh a packaged scene directory from a real2sim output dir.
+
+    The scene is written to ``<root>/<name>``, where ``root`` defaults to
+    ``assets/scenes`` inside the ``brace`` package. It contains the settled
+    ``scene.xml`` with its assets, one MJCF per object under ``objects/``, and a
+    ``scene.json`` index with each object's resting pose.
+    """
 
     source = Path(source_dir).expanduser().resolve()
     if not source.is_dir():
@@ -675,42 +687,27 @@ def package_scene(
     _validate_source(source)
 
     package_name = _snake_identifier(name or source.name)
-    root = (
-        Path(tasks_root)
-        if tasks_root is not None
-        else _repo_root() / "tasks" / "invention_real2sim"
-    )
+    root = Path(tasks_root) if tasks_root is not None else default_scenes_root()
     root = root.expanduser().resolve()
     dest = root / package_name
-    bundle = dest / "bundle"
 
     if dest.exists() and not force:
         raise FileExistsError(
-            f"task package already exists: {dest}\n"
-            "pass --force to refresh its generated wrapper and runtime bundle"
+            f"packaged scene already exists: {dest}\n"
+            "pass --force to replace it"
         )
-    if dest.exists():
-        if dest == source or source.is_relative_to(dest):
-            raise ValueError(
-                f"refusing to replace task directory containing its source: {dest}"
-            )
-        shutil.rmtree(dest)
+    if dest.exists() and (dest == source or source.is_relative_to(dest)):
+        raise ValueError(
+            f"refusing to replace scene directory containing its source: {dest}"
+        )
     root.mkdir(parents=True, exist_ok=True)
-    root_init = root / "__init__.py"
-    if not root_init.exists():
-        root_init.write_text(
-            '"""Sanitized task scenes generated from real2sim outputs."""\n',
-            encoding="utf-8",
-        )
-    dest.mkdir(parents=True, exist_ok=True)
-    task_name = f"real2sim_{package_name}"
-    default_camera = _copy_runtime_bundle(source, bundle, task_name=task_name)
-    (dest / "__init__.py").write_text(_init_py(package_name), encoding="utf-8")
-    (dest / "scene.py").write_text(
-        _scene_py(package_name, default_camera),
-        encoding="utf-8",
-    )
-    (dest / "replay.py").write_text(_replay_py(package_name), encoding="utf-8")
+    camera = _copy_runtime_bundle(source, dest, task_name=f"real2sim_{package_name}")
+    try:
+        objects = _write_object_files(dest)
+        _write_scene_json(dest, name=package_name, camera=camera, objects=objects)
+    except Exception:
+        shutil.rmtree(dest)
+        raise
     return dest
 
 
@@ -718,7 +715,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Package generated results/real2sim/<case> directories as "
-            "sanitized tasks.invention_real2sim.<case> scene modules."
+            "scene directories for the brace package."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
@@ -726,9 +723,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             Examples:
               ./scripts/rapid-real2sim results/real2sim/demo5_scene
               ./scripts/rapid-real2sim frame.png --name demo5_scene
-
-            Then launch agents with:
-              --env-module tasks.invention_real2sim.demo5_scene
             """
         ),
     )
@@ -742,18 +736,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--name",
         type=str,
         default=None,
-        help="Task package name. Defaults to a snake_case version of source_dir name.",
+        help="Scene name. Defaults to a snake_case version of source_dir name.",
     )
     parser.add_argument(
         "--tasks-root",
         type=Path,
         default=None,
-        help="Destination real2sim task root. Defaults to tasks/invention_real2sim.",
+        help=(
+            "Destination scene root. Defaults to assets/scenes inside the "
+            "brace package."
+        ),
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing packaged task wrapper and runtime bundle.",
+        help="Replace an existing packaged scene directory.",
     )
     return parser
 
@@ -779,14 +776,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     for dest in destinations:
-        module = f"tasks.invention_real2sim.{dest.name}"
-        rel_dest = dest
-        try:
-            rel_dest = dest.relative_to(_repo_root())
-        except ValueError:
-            pass
-        print(f"[real2sim.package] wrote {rel_dest}")
-        print(f"[real2sim.package] env module: {module}")
+        print(f"[real2sim.package] wrote {dest}")
     return 0
 
 

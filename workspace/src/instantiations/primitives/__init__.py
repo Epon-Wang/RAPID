@@ -1,1 +1,0 @@
-"""Primitive scene instantiations."""

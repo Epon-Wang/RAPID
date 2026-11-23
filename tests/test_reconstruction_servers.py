@@ -1,6 +1,7 @@
 """Exercise production HTTP adapters with deterministic model substitutes."""
 
 import base64
+import json
 import sys
 from contextlib import contextmanager
 from threading import Thread
@@ -283,8 +284,10 @@ def test_http_pipeline_exports_and_packages_scene(services, image, tmp_path, mon
     assert any(call[0] == "depth_anything" for call in services.calls) is not supplied_depth
     assert {call[0] for call in services.calls} >= {"sam3", "sam3d", "foundation_pose"}
     packaged = package_reconstruction(result.output_dir, name="test_scene", tasks_root=tmp_path / "tasks")
-    assert (packaged.task_dir / "scene.py").is_file()
-    final_model = mujoco.MjModel.from_xml_path(str(packaged.task_dir / "bundle/scene.xml"))
+    scene = json.loads((packaged.scene_dir / "scene.json").read_text(encoding="utf-8"))
+    assert [item["file"] for item in scene["objects"]] == ["objects/box.xml"]
+    assert mujoco.MjModel.from_xml_path(str(packaged.scene_dir / "objects/box.xml")).nbody == 2
+    final_model = mujoco.MjModel.from_xml_path(str(packaged.scene_dir / "scene.xml"))
     data = mujoco.MjData(final_model)
     mujoco.mj_step(final_model, data, nstep=10)
     assert np.isfinite(data.qpos).all()

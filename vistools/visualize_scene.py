@@ -1,26 +1,44 @@
-"""Render or interactively inspect a Python task scene module.
+"""Render or interactively inspect a packaged Real2Sim scene directory.
 
 Examples:
-    ./scripts/rapid-python -m vistools.visualize_scene tasks.invention_real2sim.demo_5_scene
-    ./scripts/rapid-python -m vistools.visualize_scene tasks.invention_real2sim.demo_5_scene --viewer
-    ./scripts/rapid-python -m vistools.visualize_scene tasks/invention_real2sim/demo_5_scene/scene.py
+    ./scripts/rapid-python -m vistools.visualize_scene demo_5_scene
+    ./scripts/rapid-python -m vistools.visualize_scene demo_5_scene --viewer
+    ./scripts/rapid-python -m vistools.visualize_scene path/to/scenes/demo_5_scene
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.util
+import json
 import os
 from pathlib import Path
-from types import ModuleType
 from typing import Any
+
+import mujoco
 
 from vistools.visualize_mujoco import (
     launch_model_viewer,
     render_model,
     _parse_vec3,
 )
+
+
+def resolve_scene_dir(scene_ref: str | Path) -> Path:
+    """Return the packaged scene directory named by a path or a bare scene name.
+
+    A bare name is looked up under the default scene root of the brace package.
+    """
+
+    path = Path(str(scene_ref)).expanduser()
+    if path.is_file():
+        path = path.parent
+    if not path.is_dir() and path.name == str(scene_ref):
+        from real2sim.package_scene import default_scenes_root
+
+        path = default_scenes_root() / path.name
+    if not (path / "scene.xml").is_file():
+        raise FileNotFoundError(f"packaged scene not found: {scene_ref}")
+    return path.resolve()
 
 
 def render_scene(
@@ -35,25 +53,26 @@ def render_scene(
     lookat: tuple[float, float, float] | None = None,
     step_count: int = 0,
 ) -> Path:
-    """Render a PNG preview of a scene module exposing ``make_model()``."""
+    """Render a PNG preview of a packaged scene."""
 
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-    module = _load_scene_module(scene_ref)
-    model = _make_model(module)
-    data = _make_data(module, model)
+    scene_dir = resolve_scene_dir(scene_ref)
     camera = _camera_options(
-        module,
+        scene_dir,
         azimuth=azimuth,
         elevation=elevation,
         distance=distance,
         lookat=lookat,
     )
-    output = Path(output_path) if output_path else _default_output_path(scene_ref, module)
+    output = (
+        Path(output_path)
+        if output_path
+        else Path("results") / "real2sim" / "previews" / f"{scene_dir.name}.png"
+    )
     return render_model(
-        model,
+        _load_model(scene_dir),
         output,
-        data=data,
         width=width,
         height=height,
         step_count=step_count,
@@ -69,87 +88,39 @@ def launch_scene_viewer(
     distance: float | None = None,
     lookat: tuple[float, float, float] | None = None,
 ) -> None:
-    """Open MuJoCo's interactive viewer for a scene module."""
+    """Open MuJoCo's interactive viewer for a packaged scene."""
 
-    module = _load_scene_module(scene_ref)
-    model = _make_model(module)
-    data = _make_data(module, model)
+    scene_dir = resolve_scene_dir(scene_ref)
     camera = _camera_options(
-        module,
+        scene_dir,
         azimuth=azimuth,
         elevation=elevation,
         distance=distance,
         lookat=lookat,
     )
-    launch_model_viewer(model, data=data, **camera)
+    launch_model_viewer(_load_model(scene_dir), **camera)
 
 
-def _load_scene_module(scene_ref: str | Path) -> ModuleType:
-    text = str(scene_ref)
-    path = Path(text).expanduser()
-    if path.is_file():
-        return _load_scene_file(path)
-    return _load_module(_normalize_module_name(text))
+def _load_model(scene_dir: Path) -> mujoco.MjModel:
+    return mujoco.MjModel.from_xml_path(str(scene_dir / "scene.xml"))
 
 
-def _load_scene_file(path: Path) -> ModuleType:
-    module_name = f"_rapid_scene_view_{abs(hash(path.resolve()))}"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"could not load scene file: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _normalize_module_name(value: str) -> str:
-    module = value.strip()
-    if not module:
-        raise ValueError("scene module cannot be empty")
-    if module.endswith(".scene"):
-        return module
-    scene_module = f"{module}.scene"
-    try:
-        if importlib.util.find_spec(scene_module) is not None:
-            return scene_module
-    except (AttributeError, ImportError, ModuleNotFoundError):
-        pass
-    return module
-
-
-def _load_module(module_name: str) -> ModuleType:
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            f"could not import {module_name!r}; pass a module like "
-            "'tasks.invention_real2sim.demo_5_scene' or a path to scene.py"
-        ) from exc
-
-
-def _make_model(module: ModuleType) -> Any:
-    make_model = getattr(module, "make_model", None)
-    if not callable(make_model):
-        raise AttributeError(f"{module.__name__} does not expose callable make_model()")
-    return make_model()
-
-
-def _make_data(module: ModuleType, model: Any) -> Any | None:
-    make_data = getattr(module, "make_data", None)
-    if not callable(make_data):
-        return None
-    return make_data(model)
+def _default_camera(scene_dir: Path) -> dict[str, Any]:
+    scene_json = scene_dir / "scene.json"
+    if not scene_json.is_file():
+        return {}
+    return json.loads(scene_json.read_text(encoding="utf-8")).get("camera") or {}
 
 
 def _camera_options(
-    module: ModuleType,
+    scene_dir: Path,
     *,
     azimuth: float | None,
     elevation: float | None,
     distance: float | None,
     lookat: tuple[float, float, float] | None,
 ) -> dict[str, Any]:
-    default_camera = getattr(module, "DEFAULT_CAMERA", {}) or {}
+    default_camera = _default_camera(scene_dir)
     return {
         "azimuth": _coalesce_float(azimuth, default_camera.get("camera_azimuth"), 135.0),
         "elevation": _coalesce_float(
@@ -190,14 +161,6 @@ def _coerce_vec3_or_none(value: Any) -> tuple[float, float, float] | None:
     return parts[0], parts[1], parts[2]
 
 
-def _default_output_path(scene_ref: str | Path, module: ModuleType) -> Path:
-    package = module.__name__.split(".")[-2] if module.__name__.endswith(".scene") else ""
-    if not package or package.startswith("_rapid_scene_view_"):
-        path = Path(str(scene_ref))
-        package = path.parent.name if path.stem == "scene" else path.stem
-    return Path("results") / "real2sim" / "previews" / f"{package}.png"
-
-
 def build_arg_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -207,8 +170,8 @@ def build_arg_parser(prog: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument(
         "scene",
         help=(
-            "Scene module or scene.py path. Module roots such as "
-            "tasks.invention_real2sim.demo_5_scene are normalized to .scene."
+            "Packaged scene directory, or the name of a scene under the brace "
+            "package's assets/scenes."
         ),
     )
     parser.add_argument(

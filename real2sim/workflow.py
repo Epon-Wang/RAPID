@@ -20,8 +20,7 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
 
 @dataclass(frozen=True)
 class PackagedScene:
-    task_dir: Path
-    module: str
+    scene_dir: Path
 
 
 @dataclass(frozen=True)
@@ -85,21 +84,17 @@ def package_reconstruction(
     tasks_root: str | Path | None = None,
     force: bool = False,
 ) -> PackagedScene:
-    """Package a Real2Sim reconstruction as an importable task scene."""
+    """Package a Real2Sim reconstruction as a scene directory for brace."""
 
     from real2sim.package_scene import package_scene
 
-    task_dir = package_scene(
-        source_dir,
-        name=name,
-        tasks_root=tasks_root,
-        force=force,
-    )
-    module = f"tasks.invention_real2sim.{task_dir.name}"
-
     return PackagedScene(
-        task_dir=task_dir,
-        module=module,
+        scene_dir=package_scene(
+            source_dir,
+            name=name,
+            tasks_root=tasks_root,
+            force=force,
+        )
     )
 
 
@@ -265,7 +260,7 @@ def build_from_input(
         if packaged is None:
             parser.error("--preview/--viewer require packaging; remove --no-package")
         assert packaged is not None
-        preview_image = _preview_packaged_scene(packaged.module, args)
+        preview_image = _preview_packaged_scene(packaged.scene_dir, args)
 
     return Real2SimBuildResult(
         reconstruction_dir=reconstruction_dir,
@@ -276,26 +271,26 @@ def build_from_input(
     )
 
 
-def _preview_packaged_scene(module: str, args: argparse.Namespace) -> Path | None:
+def _preview_packaged_scene(scene_dir: Path, args: argparse.Namespace) -> Path | None:
     from vistools.visualize_scene import launch_scene_viewer, render_scene
 
     if args.viewer:
-        launch_scene_viewer(module)
+        launch_scene_viewer(scene_dir)
         return None
     output = (
         Path(args.preview_output).expanduser().resolve()
         if args.preview_output is not None
         else None
     )
-    return render_scene(module, output)
+    return render_scene(scene_dir, output)
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rapid-real2sim",
         description=(
-            "Build a simulation-ready Real2Sim task from a video, image, RGB-D "
-            "capture directory, or existing Real2Sim scene bundle."
+            "Build a simulation-ready Real2Sim scene from a video, image, RGB-D "
+            "capture directory, or existing Real2Sim output directory."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
@@ -306,7 +301,7 @@ def _build_parser() -> argparse.ArgumentParser:
               ./scripts/rapid-real2sim frame.png --name push_scene
               ./scripts/rapid-real2sim real_scenes/scene_1 --name captured_scene
               ./scripts/rapid-real2sim results/real2sim/demo_scene --force
-              ./scripts/rapid-real2sim view tasks.invention_real2sim.demo_scene
+              ./scripts/rapid-real2sim view demo_scene
             """
         ),
     )
@@ -322,7 +317,7 @@ def _build_parser() -> argparse.ArgumentParser:
     workflow_group.add_argument(
         "--name",
         default=None,
-        help="Case/package name. Defaults to a snake_case version of the input stem.",
+        help="Scene name. Defaults to a snake_case version of the input stem.",
     )
     workflow_group.add_argument(
         "-o",
@@ -341,14 +336,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--tasks-root",
         type=Path,
         default=None,
-        help="Override the packaged task root. Defaults to tasks/invention_real2sim.",
+        help=(
+            "Override the packaged scene root. Defaults to assets/scenes inside "
+            "the brace package."
+        ),
     )
     workflow_group.add_argument(
         "--force",
         action="store_true",
         help=(
             "Clear and rebuild the reconstruction output, then fully replace "
-            "existing packaged task directories."
+            "existing packaged scene directories."
         ),
     )
     workflow_group.add_argument(
@@ -362,13 +360,13 @@ def _build_parser() -> argparse.ArgumentParser:
     workflow_group.add_argument(
         "--no-package",
         action="store_true",
-        help="Only reconstruct the Real2Sim scene bundle; do not create a task env.",
+        help="Only reconstruct; do not write a packaged scene directory.",
     )
     preview_group = workflow_group.add_mutually_exclusive_group()
     preview_group.add_argument(
         "--preview",
         action="store_true",
-        help="Render a PNG preview of the packaged task scene.",
+        help="Render a PNG preview of the packaged scene.",
     )
     workflow_group.add_argument(
         "--preview-output",
@@ -379,7 +377,7 @@ def _build_parser() -> argparse.ArgumentParser:
     preview_group.add_argument(
         "--viewer",
         action="store_true",
-        help="Open the packaged task scene in MuJoCo's interactive viewer.",
+        help="Open the packaged scene in MuJoCo's interactive viewer.",
     )
     reconstruction_group = parser.add_argument_group("reconstruction options")
     add_pipeline_options(reconstruction_group)
@@ -396,10 +394,8 @@ def _print_build_result(result: Real2SimBuildResult) -> None:
     if result.frame_image is not None:
         print(f"[real2sim] first frame   : {_display_path(result.frame_image, repo_root)}")
     if result.packaged_scene is not None:
-        task = result.packaged_scene
-        print(f"[real2sim] task package  : {_display_path(task.task_dir, repo_root)}")
-        print(f"[real2sim] env module    : {task.module}")
-        print(f"[real2sim] agent flag    : --env-module {task.module}")
+        scene_dir = result.packaged_scene.scene_dir
+        print(f"[real2sim] packaged scene: {_display_path(scene_dir, repo_root)}")
     if result.preview_image is not None:
         print(f"[real2sim] preview      : {_display_path(result.preview_image, repo_root)}")
 

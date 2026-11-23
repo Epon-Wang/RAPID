@@ -1,10 +1,10 @@
 """Render or interactively inspect a MuJoCo XML scene.
 
 Examples:
-    conda run -n rapid python -m vistools.visualize_mujoco scene.xml
-    conda run -n rapid python -m vistools.visualize_mujoco scene.xml --orbit-video scene_orbit.mp4
-    conda run -n rapid python -m vistools.visualize_mujoco scene.xml --settle-video scene_settle.mp4
-    conda run -n rapid python -m vistools.visualize_mujoco scene.xml --viewer
+    ./scripts/rapid-python -m vistools.visualize_mujoco scene.xml
+    ./scripts/rapid-python -m vistools.visualize_mujoco scene.xml --orbit-video scene_orbit.mp4
+    ./scripts/rapid-python -m vistools.visualize_mujoco scene.xml --settle-video scene_settle.mp4
+    ./scripts/rapid-python -m vistools.visualize_mujoco scene.xml --viewer
 """
 
 from __future__ import annotations

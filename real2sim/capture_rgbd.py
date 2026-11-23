@@ -414,8 +414,8 @@ def build_mode_parser() -> argparse.ArgumentParser:
         "demo",
         add_help=False,
         help=(
-            "Record synchronized L515 RGB-D video under "
-            "demos/strategy/demo_N."
+            "Record synchronized L515 RGB-D video as demo_N under the BRACE "
+            "checkout's demos/ folder."
         ),
     )
     return parser

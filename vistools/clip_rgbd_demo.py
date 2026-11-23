@@ -466,7 +466,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "source",
         type=Path,
-        help="Source directory such as demos/strategy/demo_1.",
+        help="Recorded demo directory, such as demos/demo_1 in the BRACE checkout.",
     )
     parser.add_argument(
         "--start",

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Record synchronized, calibrated L515 RGB-D demonstration videos.
 
-Each recording is written atomically to ``demos/strategy/demo_N``.
+Each recording is written atomically to ``demos/demo_N`` at the root of the
+BRACE checkout that contains this repository as ``third_party/RAPID``.
 The color stream is an ordinary H.264 MP4, while aligned sensor depth is kept
 losslessly as 16-bit FFV1 in Matroska.  A viewable depth-preview MP4 and exact
 per-frame timestamps share the same frame indexing.  The first RGB-D frame is
@@ -45,7 +46,8 @@ from vistools.rgbd_format import (
     CAPTURE_METADATA_FILENAME,
 )
 
-DEFAULT_DEMOS_ROOT = REPO_ROOT / "demos" / "strategy"
+# This repository lives at <BRACE>/third_party/RAPID; recordings go to <BRACE>/demos.
+DEFAULT_DEMOS_ROOT = REPO_ROOT.parents[1] / "demos"
 DEFAULT_COLOR_WIDTH = 1280
 DEFAULT_COLOR_HEIGHT = 720
 DEFAULT_DEPTH_WIDTH = 640
@@ -800,8 +802,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rapid-real2sim-capture demo",
         description=(
-            "Record synchronized L515 RGB-D video as "
-            "demos/strategy/demo_N."
+            "Record synchronized L515 RGB-D video as demo_N under the BRACE "
+            "checkout's demos/ folder."
         )
     )
     parser.add_argument(

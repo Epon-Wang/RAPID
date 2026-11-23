@@ -209,7 +209,7 @@ class RGBDCaptureWorkflowTest(unittest.TestCase):
 
 
 class ScenePreviewWorkflowTest(unittest.TestCase):
-    def test_packages_and_previews_fr3_scene(self) -> None:
+    def test_packages_and_previews_scene_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "result"
@@ -217,7 +217,7 @@ class ScenePreviewWorkflowTest(unittest.TestCase):
             (source / "scene.xml").write_text("<mujoco/>", encoding="utf-8")
             parser = workflow._build_parser()
             args = parser.parse_args([str(source), "--preview"])
-            arm = workflow.PackagedScene(root / "arm", "tasks.invention_real2sim.result")
+            arm = workflow.PackagedScene(root / "scenes" / "result")
             preview = root / "preview.png"
             with (
                 mock.patch.object(
@@ -234,7 +234,7 @@ class ScenePreviewWorkflowTest(unittest.TestCase):
                 result = workflow.build_from_input(source, args, parser)
 
             package_arm.assert_called_once()
-            render.assert_called_once_with(arm.module, args)
+            render.assert_called_once_with(arm.scene_dir, args)
             self.assertEqual(result.packaged_scene, arm)
             self.assertEqual(result.preview_image, preview)
 

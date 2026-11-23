@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import os
+import json
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -25,7 +25,6 @@ from real2sim.mujoco_export import (
 )
 from real2sim.schema import PipelineConfig
 from real2sim.workflow import package_reconstruction
-from scene_io.runtime_assets import fr3_task_v1_root, fr3_task_v1_xml
 
 
 def _arbitrary_rotation() -> np.ndarray:
@@ -79,31 +78,6 @@ def _object(mesh_file: str, vertices: np.ndarray, *, is_static: bool = False):
         world_bounds=bounds.tolist(),
         is_static=is_static,
     )
-
-
-class RuntimeAssetResolverTest(unittest.TestCase):
-    def test_uses_explicit_repo_root_for_isolated_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
-            robot_xml = repo_root / "runtime_assets/fr3/fr3_task_v1/robot.xml"
-            robot_xml.parent.mkdir(parents=True)
-            robot_xml.write_text("<mujoco/>\n", encoding="utf-8")
-
-            with patch.dict(
-                os.environ,
-                {"RAPID_REPO_ROOT": str(repo_root)},
-                clear=False,
-            ):
-                self.assertEqual(fr3_task_v1_xml(), robot_xml.resolve())
-
-    def test_direct_repository_fallback_needs_no_environment_variable(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("RAPID_REPO_ROOT", None)
-            self.assertEqual(
-                fr3_task_v1_root(),
-                Path(__file__).resolve().parents[1]
-                / "runtime_assets/fr3/fr3_task_v1",
-            )
 
 
 class OrientedCollisionBoxTest(unittest.TestCase):
@@ -327,264 +301,158 @@ class InitialObjectPenetrationTest(unittest.TestCase):
             )
 
 
-class SharedFR3PackagingTest(unittest.TestCase):
-    def test_packaging_uses_shared_fr3_at_home(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            source.mkdir()
-            mesh, _ = _rotated_box_mesh()
-            mesh.export(source / "object.obj")
-            (source / "scene.xml").write_text(
-                """<mujoco model="source">
+_SOURCE_SCENE_XML = """<mujoco model="source">
   <compiler meshdir="."/>
   <asset>
     <mesh name="object_visual_mesh" file="object.obj"/>
     <mesh name="object_collision_mesh" file="object.obj"/>
   </asset>
   <worldbody>
-    <geom name="floor" type="plane" size="1 1 0.01"/>
+    <geom name="floor" type="plane" size="1 1 0.01" friction="0.44 0.01 0.001"/>
     <body name="object">
       <freejoint/>
       <inertial mass="0.2" pos="0 0 0" diaginertia="0.001 0.001 0.001"/>
       <geom name="object_visual" type="mesh" mesh="object_visual_mesh"
             contype="0" conaffinity="0"/>
-      <geom name="object_collision" type="box" size="1 1 1"/>
+      <geom name="object_collision" type="box" size="0.2 0.1 0.05" friction="0.38 0.007 0.001"/>
+    </body>
+    <body name="fixture" pos="0.7 0.3 0.05">
+      <geom name="fixture_collision" type="box" size="0.05 0.05 0.05"/>
     </body>
   </worldbody>
 </mujoco>
-""",
-                encoding="utf-8",
-            )
-            (source / "metadata.json").write_text(
-                """{
-  "objects": [
-    {
-      "safe_name": "object",
-      "obb_source_mesh_file": "object.obj"
-    }
-  ]
-}
-""",
-                encoding="utf-8",
-            )
-
-            tasks_root = root / "tasks"
-            tasks_root.mkdir()
-            result = package_reconstruction(
-                source,
-                name="tool_free",
-                tasks_root=tasks_root,
-            )
-            destination = result.task_dir
-            self.assertEqual(result.module, "tasks.invention_real2sim.tool_free")
-            self.assertFalse(hasattr(result, "end_effector"))
-
-            scene_xml = destination / "bundle" / "scene.xml"
-            packaged = ET.parse(scene_xml).getroot()
-            body_names = {body.get("name") for body in packaged.findall(".//body")}
-            self.assertIn("object", body_names)
-            self.assertNotIn("fr3", body_names)
-            self.assertFalse((destination / "bundle" / "fr3").exists())
-            fr3_root = fr3_task_v1_root()
-            self.assertTrue((fr3_root / "LICENSE").is_file())
-            self.assertIsNone(ET.parse(fr3_root / "defaults.xml").find("sensor"))
-            self.assertEqual(
-                len(list((fr3_root / "meshes").iterdir())),
-                50,
-            )
-            self.assertEqual(packaged.get("model"), "real2sim_tool_free")
-            collision = packaged.find(
-                "./worldbody/body[@name='object']/geom[@name='object_collision']"
-            )
-            self.assertIsNotNone(collision)
-            assert collision is not None
-            self.assertEqual(collision.get("type"), "box")
-            self.assertIsNone(collision.get("mesh"))
-            np.testing.assert_allclose(
-                np.sort(np.fromstring(collision.get("size", ""), sep=" ") * 2.0),
-                np.sort([0.4, 0.2, 0.1]),
-                atol=1e-8,
-            )
-            self.assertIsNone(
-                packaged.find("./asset/mesh[@name='object_collision_mesh']")
-            )
-            model = mujoco.MjModel.from_xml_path(str(scene_xml))
-            self.assertEqual(model.nu, 0)
-            expected_home = [
-                -0.0030637685314503847,
-                -0.7778934457717781,
-                0.01585533499243391,
-                -2.3693353790401894,
-                -0.004060005459262234,
-                1.554097367289531,
-                0.7704814906387026,
-            ]
-            for mesh in ET.parse(fr3_root / "assets.xml").findall("./asset/mesh"):
-                asset_path = (fr3_root / str(mesh.get("file"))).resolve()
-                self.assertTrue(asset_path.is_relative_to(fr3_root))
-                self.assertTrue(asset_path.is_file())
-
-            module_spec = importlib.util.spec_from_file_location(
-                "_standalone_fr3_scene_test",
-                destination / "scene.py",
-            )
-            assert module_spec is not None and module_spec.loader is not None
-            scene_module = importlib.util.module_from_spec(module_spec)
-            module_spec.loader.exec_module(scene_module)
-            self.assertEqual(scene_module.FR3_XML, fr3_root / "robot.xml")
-            model = scene_module.make_model()
-            module_data = scene_module.make_data(model)
-            np.testing.assert_allclose(scene_module.FR3_BASE_POS, [0.0, 0.0, 0.0])
-            np.testing.assert_allclose(scene_module.FR3_BASE_QUAT, [1.0, 0.0, 0.0, 0.0])
-            np.testing.assert_allclose(
-                module_data.body("fr3").xpos,
-                [0.0, 0.0, 0.0],
-                atol=1e-12,
-            )
-            np.testing.assert_allclose(
-                module_data.body("fr3").xquat,
-                [1.0, 0.0, 0.0, 0.0],
-                atol=1e-12,
-            )
-            self.assertGreaterEqual(model.body("hand").id, 0)
-            self.assertEqual(model.nu, 8)
-            self.assertEqual(model.nsensor, 0)
-            self.assertEqual(
-                [model.actuator(index).name for index in range(model.nu)],
-                [
-                    "fr3_joint1",
-                    "fr3_joint2",
-                    "fr3_joint3",
-                    "fr3_joint4",
-                    "fr3_joint5",
-                    "fr3_joint6",
-                    "fr3_joint7",
-                    "fr3_hand",
-                ],
-            )
-            np.testing.assert_allclose(
-                model.actuator_gainprm[:, 0],
-                [4500, 4500, 3500, 3500, 2000, 2000, 2000, 10000],
-            )
-            self.assertEqual(model.nkey, 1)
-            self.assertEqual(model.key(0).name, "home")
-            reset_data = mujoco.MjData(model)
-            mujoco.mj_resetDataKeyframe(model, reset_data, 0)
-            for index, expected in enumerate(expected_home, start=1):
-                joint_id = model.joint(f"fr3_joint{index}").id
-                qpos_address = model.jnt_qposadr[joint_id]
-                self.assertAlmostEqual(
-                    model.key_qpos[0, qpos_address],
-                    expected,
-                )
-                self.assertAlmostEqual(
-                    reset_data.qpos[qpos_address],
-                    expected,
-                )
-                self.assertAlmostEqual(
-                    module_data.qpos[qpos_address],
-                    expected,
-                )
-                self.assertAlmostEqual(module_data.ctrl[index - 1], expected)
-                self.assertAlmostEqual(model.key_ctrl[0, index - 1], expected)
-            np.testing.assert_allclose(reset_data.ctrl, module_data.ctrl)
-            for finger_name in ("finger_joint1", "finger_joint2"):
-                finger_id = model.joint(finger_name).id
-                self.assertAlmostEqual(
-                    module_data.qpos[model.jnt_qposadr[finger_id]],
-                    0.04,
-                )
-            self.assertAlmostEqual(module_data.ctrl[7], 0.04)
-            finger_gap = np.linalg.norm(
-                module_data.body("left_finger").xpos
-                - module_data.body("right_finger").xpos
-            )
-            self.assertAlmostEqual(float(finger_gap), 0.08, places=8)
-            for side in ("left", "right"):
-                for index in range(6):
-                    geom_name = f"{side}_finger_collision_{index}"
-                    np.testing.assert_allclose(
-                        model.geom_friction[model.geom(geom_name).id],
-                        (1.5, 0.02, 0.002),
-                    )
-            np.testing.assert_allclose(
-                model.geom_friction[model.geom("hand_collision").id],
-                [0.5, 0.005, 0.0001],
-            )
+"""
 
 
-class Real2SimBenchmarkPlaceholderTest(unittest.TestCase):
-    def test_placeholders_match_corresponding_demo_scenes(self) -> None:
-        tasks_root = Path(__file__).resolve().parents[1] / "tasks"
-        shared_fr3 = fr3_task_v1_root() / "robot.xml"
+def _write_reconstruction(source: Path) -> None:
+    """Write a minimal Real2Sim output: one free object, one fixed object."""
 
-        for index in range(1, 9):
-            with self.subTest(strategy=index):
-                original_dir = tasks_root / "invention_real2sim" / f"demo_{index}_scene"
-                benchmark_dir = (
-                    tasks_root
-                    / "sim_benchmark"
-                    / f"strategy_{index}"
-                    / "case_000_scene"
-                )
-                self.assertFalse((benchmark_dir / "bundle" / "fr3").exists())
-                self.assertEqual(
-                    (benchmark_dir / "bundle" / "metadata.json").read_bytes(),
-                    (original_dir / "bundle" / "metadata.json").read_bytes(),
-                )
+    source.mkdir()
+    mesh, _ = _rotated_box_mesh()
+    mesh.export(source / "object.obj")
+    (source / "scene.xml").write_text(_SOURCE_SCENE_XML, encoding="utf-8")
+    (source / "metadata.json").write_text(
+        json.dumps(
+            {
+                "objects": [
+                    {
+                        "name": "test box",
+                        "safe_name": "object",
+                        "obb_source_mesh_file": "object.obj",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
 
-                original_xml = ET.parse(original_dir / "bundle" / "scene.xml").getroot()
-                benchmark_xml = ET.parse(benchmark_dir / "bundle" / "scene.xml").getroot()
-                self.assertEqual(
-                    benchmark_xml.get("model"),
-                    f"sim_benchmark_strategy_{index}_case_000_scene",
-                )
-                original_xml.set("model", "normalized")
-                benchmark_xml.set("model", "normalized")
-                self.assertEqual(
-                    ET.tostring(benchmark_xml),
-                    ET.tostring(original_xml),
-                )
 
-                original = importlib.import_module(
-                    f"tasks.invention_real2sim.demo_{index}_scene.scene"
-                )
-                benchmark = importlib.import_module(
-                    "tasks.sim_benchmark."
-                    f"strategy_{index}.case_000_scene.scene"
-                )
-                self.assertEqual(benchmark.FR3_XML, shared_fr3)
-                original_model = original.make_model()
-                benchmark_model = benchmark.make_model()
-                self.assertEqual(benchmark_model.nbody, original_model.nbody)
-                self.assertEqual(benchmark_model.ngeom, original_model.ngeom)
-                self.assertEqual(benchmark_model.nu, original_model.nu)
-                self.assertEqual(benchmark_model.nkey, original_model.nkey)
+def _scene_entry(scene_dir: Path, body: str) -> dict:
+    scene = json.loads((scene_dir / "scene.json").read_text(encoding="utf-8"))
+    return next(item for item in scene["objects"] if item["body"] == body)
 
-class FR3OriginTest(unittest.TestCase):
-    def test_package_always_places_fr3_at_world_origin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            source.mkdir()
-            (source / "scene.xml").write_text(
-                '<mujoco><worldbody><geom type="plane" size="1 1 0.01"/>'
-                "</worldbody></mujoco>",
-                encoding="utf-8",
-            )
-            tasks_root = root / "tasks"
-            tasks_root.mkdir()
 
-            result = package_reconstruction(
-                source,
-                name="calibrated",
-                tasks_root=tasks_root,
-            )
+class BraceScenePackagingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        _write_reconstruction(self.root / "source")
+        self.result = package_reconstruction(
+            self.root / "source",
+            name="tool_free",
+            tasks_root=self.root / "scenes",
+        )
+        self.scene_dir = self.result.scene_dir
 
-            scene_text = (result.task_dir / "scene.py").read_text(encoding="utf-8")
-            self.assertIn("FR3_BASE_POS = (0.0, 0.0, 0.0)", scene_text)
-            self.assertIn("FR3_BASE_QUAT = (1.0, 0.0, 0.0, 0.0)", scene_text)
+    def test_writes_scene_directory_without_python_wrappers(self) -> None:
+        self.assertEqual(self.scene_dir, (self.root / "scenes" / "tool_free").resolve())
+        for name in ("scene.json", "scene.xml", "objects/object.xml", "objects/fixture.xml"):
+            self.assertTrue((self.scene_dir / name).is_file(), name)
+        for name in ("scene.py", "replay.py", "__init__.py", "bundle"):
+            self.assertFalse((self.scene_dir / name).exists(), name)
+        self.assertFalse((self.root / "scenes" / "__init__.py").exists())
+
+    def test_object_file_compiles_alone_as_one_free_body_at_the_origin(self) -> None:
+        model = mujoco.MjModel.from_xml_path(str(self.scene_dir / "objects" / "object.xml"))
+
+        self.assertEqual(model.nbody, 2)
+        self.assertEqual(model.body(1).name, "object")
+        self.assertEqual(model.njnt, 1)
+        self.assertEqual(model.jnt_type[0], mujoco.mjtJoint.mjJNT_FREE)
+        np.testing.assert_allclose(model.qpos0, [0, 0, 0, 1, 0, 0, 0], atol=1e-12)
+        self.assertAlmostEqual(float(model.body_mass[1]), 0.2)
+        geom_types = [int(kind) for kind in model.geom_type]
+        self.assertIn(int(mujoco.mjtGeom.mjGEOM_MESH), geom_types)
+        self.assertIn(int(mujoco.mjtGeom.mjGEOM_BOX), geom_types)
+
+    def test_scene_json_records_the_resting_pose_of_each_object(self) -> None:
+        entry = _scene_entry(self.scene_dir, "object")
+        scene_model = mujoco.MjModel.from_xml_path(str(self.scene_dir / "scene.xml"))
+        address = scene_model.jnt_qposadr[scene_model.body("object").jntadr[0]]
+
+        self.assertEqual(entry["file"], "objects/object.xml")
+        self.assertEqual(entry["name"], "test box")
+        self.assertFalse(entry["fixed"])
+        np.testing.assert_allclose(entry["pos"], scene_model.qpos0[address : address + 3], atol=1e-6)
+        np.testing.assert_allclose(entry["quat"], scene_model.qpos0[address + 3 : address + 7], atol=1e-6)
+        self.assertAlmostEqual(entry["mass"], 0.2)
+        np.testing.assert_allclose(entry["friction"], [0.38, 0.007, 0.001])
+
+    def test_fixed_object_keeps_its_pose_in_scene_json_and_has_no_joint(self) -> None:
+        entry = _scene_entry(self.scene_dir, "fixture")
+        model = mujoco.MjModel.from_xml_path(str(self.scene_dir / "objects" / "fixture.xml"))
+
+        self.assertTrue(entry["fixed"])
+        np.testing.assert_allclose(entry["pos"], [0.7, 0.3, 0.05])
+        np.testing.assert_allclose(entry["quat"], [1, 0, 0, 0])
+        self.assertEqual(model.njnt, 0)
+        np.testing.assert_allclose(model.body_pos[1], [0, 0, 0])
+
+    def test_scene_json_records_floor_height_and_friction(self) -> None:
+        source = self.root / "raised"
+        source.mkdir()
+        (source / "scene.xml").write_text(
+            '<mujoco><worldbody><geom name="floor" type="plane" pos="0 0 0.05" '
+            'size="1 1 0.01" friction="0.44 0.01 0.001"/></worldbody></mujoco>',
+            encoding="utf-8",
+        )
+
+        result = package_reconstruction(source, name="raised", tasks_root=self.root / "scenes")
+        scene = json.loads((result.scene_dir / "scene.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(scene["name"], "raised")
+        self.assertEqual(scene["objects"], [])
+        self.assertAlmostEqual(scene["floor"]["height"], 0.05)
+        np.testing.assert_allclose(scene["floor"]["friction"], [0.44, 0.01, 0.001])
+
+
+class DefaultSceneRootTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        _write_reconstruction(self.root / "source")
+
+    def test_defaults_to_assets_scenes_inside_the_brace_package(self) -> None:
+        package_dir = self.root / "site" / "brace"
+        package_dir.mkdir(parents=True)
+        fake_brace = types.ModuleType("brace")
+        fake_brace.__file__ = str(package_dir / "__init__.py")
+
+        with patch.dict(sys.modules, {"brace": fake_brace}):
+            result = package_reconstruction(self.root / "source", name="tool_free")
+
+        self.assertEqual(
+            result.scene_dir,
+            (package_dir / "assets" / "scenes" / "tool_free").resolve(),
+        )
+        self.assertTrue((result.scene_dir / "scene.json").is_file())
+
+    def test_explains_how_to_proceed_when_brace_is_not_installed(self) -> None:
+        with patch.dict(sys.modules, {"brace": None}):
+            with self.assertRaisesRegex(RuntimeError, "--tasks-root"):
+                package_reconstruction(self.root / "source", name="tool_free")
 
 
 if __name__ == "__main__":

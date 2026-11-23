@@ -74,8 +74,10 @@ def _frame(index: int, *, shape: tuple[int, int] = (4, 4)) -> RGBDVideoFrame:
 
 
 class RGBDDemoCaptureTest(unittest.TestCase):
-    def test_default_demo_root_has_the_expected_name(self) -> None:
-        self.assertEqual(DEFAULT_DEMOS_ROOT.parts[-2:], ("demos", "strategy"))
+    def test_default_demo_root_is_the_demos_folder_of_the_brace_checkout(self) -> None:
+        rapid_root = Path(__file__).resolve().parents[1]
+        self.assertEqual(rapid_root.parts[-2:], ("third_party", "RAPID"))
+        self.assertEqual(DEFAULT_DEMOS_ROOT, rapid_root.parents[1] / "demos")
 
     def test_uses_next_numeric_demo_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

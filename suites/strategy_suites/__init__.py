@@ -1,1 +1,0 @@
-"""Strategy-composition suite manifests."""
